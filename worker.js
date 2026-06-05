@@ -53,6 +53,8 @@ async function loadKeywords() {
  * 检查消息是否包含脏话或广告
  */
 function containsBadWordsOrAds(text) {
+  text = String(text || '');
+
   if (!BAD_WORDS.plain || !BAD_WORDS.regex || !AD_WORDS.plain || !AD_WORDS.regex) {
     console.error('关键词尚未加载');
     return null;
@@ -83,6 +85,23 @@ function containsBadWordsOrAds(text) {
   }
 
   return null;
+}
+
+/**
+ * 提取可用于过滤的消息文本
+ */
+function getMessageText(message) {
+  return [
+    message.text,
+    message.caption,
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * 检查是否为通过内联机器人发送的消息
+ */
+function isViaBotMessage(message) {
+  return Boolean(message.via_bot);
 }
 
 /**
@@ -222,6 +241,9 @@ function splitMessage(text, maxLength = 4096) {
  * https://core.telegram.org/bots/api#message
  */
 async function onMessage(message) {
+  const messageText = getMessageText(message);
+  const isAdmin = message.chat.id.toString() === ADMIN_UID;
+
   if (message.text === '/start') {
     try {
       const startMsg = await fetch(START_MSG_URL);
@@ -251,7 +273,7 @@ async function onMessage(message) {
     return;
   }
 
-  const checkResult = containsBadWordsOrAds(message.text);
+  const checkResult = !isAdmin && isViaBotMessage(message) ? 'adWord' : containsBadWordsOrAds(messageText);
   if (checkResult === 'badWord') {
     await sendMessage({
       chat_id: message.chat.id,
@@ -267,7 +289,7 @@ async function onMessage(message) {
   }
 
   // 处理添加脏话和广告关键词
-  if (message.chat.id.toString() === ADMIN_UID) {
+  if (isAdmin) {
     if (/^\/addbadword\s+(.+)$/.exec(message.text)) {
       const keyword = message.text.match(/^\/addbadword\s+(.+)$/)[1];
       return await addBadWord(keyword, message.chat.id);
