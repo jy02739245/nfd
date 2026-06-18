@@ -78,6 +78,9 @@ No Fraud / Node Forward Bot
   - 模型1名称，例如 `openai/gpt-4o-mini`
 - `ENV_AI_MODEL1_PATH`
   - 可选，默认 `/chat/completions`
+- `ENV_AI_MODEL1_TYPES`
+  - 可选，默认 `["text"]`
+  - 用于声明模型支持的输入类型，可设置为 `["text"]` 或 `["text","image"]`
 
 模型2配置：
 
@@ -85,6 +88,20 @@ No Fraud / Node Forward Bot
 - `ENV_AI_MODEL2_API_KEY`
 - `ENV_AI_MODEL2_MODEL`
 - `ENV_AI_MODEL2_PATH`
+- `ENV_AI_MODEL2_TYPES`
+  - 可选，默认 `["text"]`
+
+图片消息调度规则：
+
+- 如果消息包含图片，优先使用支持 `image` 的模型
+- 如果某个模型不支持图片，但支持 `text`，会自动去掉图片，仅发送文字/caption，避免模型报错
+- 如果消息是纯图片，而某个模型只支持 `text`，则该模型会被跳过
+- 轮询模式下：
+  - 先尝试支持图片的模型
+  - 图片模型失败或超时后，再回退到文本模型（如果消息里有 caption/文字）
+- 并发模式下：
+  - 支持图片的模型会收到图文输入
+  - 不支持图片的模型会收到过滤后的纯文字输入
 
 示例：
 
@@ -97,10 +114,12 @@ ENV_DEBUG_LOG_FULL_TEXT=false
 ENV_AI_MODEL1_BASE_URL=https://openrouter.ai/api/v1
 ENV_AI_MODEL1_API_KEY=sk-xxxx
 ENV_AI_MODEL1_MODEL=openai/gpt-4o-mini
+ENV_AI_MODEL1_TYPES=["text"]
 
 ENV_AI_MODEL2_BASE_URL=https://openrouter.ai/api/v1
 ENV_AI_MODEL2_API_KEY=sk-xxxx
 ENV_AI_MODEL2_MODEL=anthropic/claude-3.5-haiku
+ENV_AI_MODEL2_TYPES=["text","image"]
 ```
 
 ## 使用方法
@@ -161,6 +180,9 @@ ENV_AI_MODEL2_MODEL=anthropic/claude-3.5-haiku
     - 对应节点的模型名
 - ENV_AI_MODEL1_PATH / ENV_AI_MODEL2_PATH：
     - 可选，默认 `/chat/completions`
+- ENV_AI_MODEL1_TYPES / ENV_AI_MODEL2_TYPES：
+    - 可选，默认 `["text"]`
+    - 可设置为 `["text"]` 或 `["text","image"]`
 - ENV_GITHUB_API_URL（github仓库API 暂无功能 可以不用添加）	
 - ENV_GITHUB_TOKEN（github仓库token 暂无功能 可以不用添加）	
 

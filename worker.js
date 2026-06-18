@@ -36,7 +36,8 @@ const AI_PRIMARY_CONFIG = createAiProviderConfig({
   baseUrl: typeof ENV_AI_MODEL1_BASE_URL === 'undefined' ? '' : ENV_AI_MODEL1_BASE_URL || '',
   apiKey: typeof ENV_AI_MODEL1_API_KEY === 'undefined' ? '' : ENV_AI_MODEL1_API_KEY || '',
   model: typeof ENV_AI_MODEL1_MODEL === 'undefined' ? '' : ENV_AI_MODEL1_MODEL || '',
-  endpointPath: typeof ENV_AI_MODEL1_PATH === 'undefined' ? '/chat/completions' : ENV_AI_MODEL1_PATH || '/chat/completions'
+  endpointPath: typeof ENV_AI_MODEL1_PATH === 'undefined' ? '/chat/completions' : ENV_AI_MODEL1_PATH || '/chat/completions',
+  inputTypes: parseModelTypes(typeof ENV_AI_MODEL1_TYPES === 'undefined' ? undefined : ENV_AI_MODEL1_TYPES)
 });
 
 const AI_BACKUP_CONFIG = createAiProviderConfig({
@@ -44,7 +45,8 @@ const AI_BACKUP_CONFIG = createAiProviderConfig({
   baseUrl: typeof ENV_AI_MODEL2_BASE_URL === 'undefined' ? '' : ENV_AI_MODEL2_BASE_URL || '',
   apiKey: typeof ENV_AI_MODEL2_API_KEY === 'undefined' ? '' : ENV_AI_MODEL2_API_KEY || '',
   model: typeof ENV_AI_MODEL2_MODEL === 'undefined' ? '' : ENV_AI_MODEL2_MODEL || '',
-  endpointPath: typeof ENV_AI_MODEL2_PATH === 'undefined' ? '/chat/completions' : ENV_AI_MODEL2_PATH || '/chat/completions'
+  endpointPath: typeof ENV_AI_MODEL2_PATH === 'undefined' ? '/chat/completions' : ENV_AI_MODEL2_PATH || '/chat/completions',
+  inputTypes: parseModelTypes(typeof ENV_AI_MODEL2_TYPES === 'undefined' ? undefined : ENV_AI_MODEL2_TYPES)
 });
 
 const AI_PROVIDERS = [AI_PRIMARY_CONFIG, AI_BACKUP_CONFIG].filter(Boolean);
@@ -79,8 +81,17 @@ function detectMessageKind(message) {
   return 'other';
 }
 
+function getMessageTextContent(message) {
+  return (message?.text || message?.caption || '').trim();
+}
+
+function getLargestPhotoFileId(message) {
+  const photos = Array.isArray(message?.photo) ? message.photo : [];
+  return photos.length > 0 ? photos[photos.length - 1].file_id : null;
+}
+
 function summarizeMessageForLog(message) {
-  const rawText = (message.text || message.caption || '').trim();
+  const rawText = getMessageTextContent(message);
 
   return {
     chatId: message.chat?.id,
@@ -104,6 +115,123 @@ function logEvent(title, payload = null) {
 
 function getTextPreviewForLog(text, maxLength = 80) {
   return DEBUG_LOG_FULL_TEXT ? String(text || '').trim() : truncateForLog(text, maxLength);
+}
+
+function getAiModeLabel() {
+  return AI_CONCURRENT && AI_PROVIDERS.length > 1 ? '并发抢答' : '主备轮询';
+}
+
+function getDecisionLabel(type) {
+  if (type === 'adWord') {
+    return '广告';
+  }
+
+  if (type === 'badWord') {
+    return '违规';
+  }
+
+  return '正常消息';
+}
+
+function getTelegramFileDownloadUrl(filePath) {
+  return `https://api.telegram.org/file/bot${TOKEN}/${filePath}`;
+}
+
+function parseModelTypes(value) {
+  if (value === undefined || value === null || value === '') {
+    return ['text'];
+  }
+
+  let rawTypes = [];
+  if (Array.isArray(value)) {
+    rawTypes = value;
+  } else {
+    const text = String(value).trim();
+    try {
+      const parsed = JSON.parse(text);
+      rawTypes = Array.isArray(parsed) ? parsed : [text];
+    } catch (error) {
+      rawTypes = text.split(',');
+    }
+  }
+
+  const normalized = rawTypes
+    .map(item => String(item).trim().toLowerCase())
+    .filter(item => item === 'text' || item === 'image');
+
+  return normalized.length > 0 ? Array.from(new Set(normalized)) : ['text'];
+}
+
+function normalizeAiInput(input) {
+  if (typeof input === 'string') {
+    return {
+      text: input.trim(),
+      imageUrl: ''
+    };
+  }
+
+  return {
+    text: String(input?.text || '').trim(),
+    imageUrl: String(input?.imageUrl || '').trim()
+  };
+}
+
+function providerSupportsType(provider, type) {
+  return Array.isArray(provider?.inputTypes) && provider.inputTypes.includes(type);
+}
+
+function getProviderInputForModeration(provider, input) {
+  const normalizedInput = normalizeAiInput(input);
+  const hasText = Boolean(normalizedInput.text);
+  const hasImage = Boolean(normalizedInput.imageUrl);
+  const supportsText = providerSupportsType(provider, 'text');
+  const supportsImage = providerSupportsType(provider, 'image');
+
+  if (hasImage && supportsImage) {
+    return {
+      text: supportsText ? normalizedInput.text : '',
+      imageUrl: normalizedInput.imageUrl
+    };
+  }
+
+  if (hasText && supportsText) {
+    return normalizedInput.text;
+  }
+
+  return null;
+}
+
+function buildAiExecutionPlans(input) {
+  const normalizedInput = normalizeAiInput(input);
+  const hasImage = Boolean(normalizedInput.imageUrl);
+  const imageCapablePlans = [];
+  const textOnlyPlans = [];
+  const skippedProviders = [];
+
+  for (const provider of AI_PROVIDERS) {
+    const providerInput = getProviderInputForModeration(provider, normalizedInput);
+    if (!providerInput) {
+      skippedProviders.push(provider.name);
+      continue;
+    }
+
+    const plan = {
+      provider,
+      providerInput
+    };
+
+    if (hasImage && providerSupportsType(provider, 'image')) {
+      imageCapablePlans.push(plan);
+    } else {
+      textOnlyPlans.push(plan);
+    }
+  }
+
+  return {
+    plans: hasImage ? imageCapablePlans.concat(textOnlyPlans) : imageCapablePlans.concat(textOnlyPlans),
+    skippedProviders,
+    hasImage
+  };
 }
 
 function parseBoolean(value, defaultValue = false) {
@@ -131,7 +259,7 @@ function parsePositiveInt(value, defaultValue) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
 }
 
-function createAiProviderConfig({ name, baseUrl, apiKey, model, endpointPath }) {
+function createAiProviderConfig({ name, baseUrl, apiKey, model, endpointPath, inputTypes }) {
   if (!baseUrl || !model) {
     return null;
   }
@@ -140,6 +268,7 @@ function createAiProviderConfig({ name, baseUrl, apiKey, model, endpointPath }) 
     name,
     apiKey,
     model,
+    inputTypes: Array.isArray(inputTypes) && inputTypes.length > 0 ? inputTypes : ['text'],
     endpoint: buildAiEndpoint(baseUrl, endpointPath)
   };
 }
@@ -284,34 +413,90 @@ async function moderateMessageContent(text) {
     textLength: text.length,
     preview: getTextPreviewForLog(text),
     mode: AI_CONCURRENT ? 'concurrent' : 'sequential',
-    providers: AI_PROVIDERS.map(provider => provider.name)
+    providers: AI_PROVIDERS.map(provider => ({
+      name: provider.name,
+      inputTypes: provider.inputTypes
+    }))
   });
 
   return classifyMessageWithAI(text);
 }
 
-async function classifyMessageWithAI(text) {
-  if (!AI_ENABLED || !text.trim() || AI_PROVIDERS.length === 0) {
+async function buildAiInputFromMessage(message) {
+  const text = getMessageTextContent(message);
+  const photoFileId = getLargestPhotoFileId(message);
+
+  if (!photoFileId) {
+    return text;
+  }
+
+  const fileInfo = await getFile({ file_id: photoFileId });
+  if (!fileInfo || !fileInfo.ok || !fileInfo.result?.file_path) {
+    logEvent('⚠️ [AI审核] 图片文件地址获取失败，降级为纯文字', {
+      messageId: message.message_id,
+      chatId: message.chat?.id
+    });
+    return text;
+  }
+
+  return {
+    text,
+    imageUrl: getTelegramFileDownloadUrl(fileInfo.result.file_path)
+  };
+}
+
+async function executeAiModeration(text) {
+  const executionPlan = buildAiExecutionPlans(text);
+
+  logEvent('🗂️ [AI审核] 执行计划', {
+    hasImage: executionPlan.hasImage,
+    planProviders: executionPlan.plans.map(item => ({
+      provider: item.provider.name,
+      model: item.provider.model,
+      inputTypes: item.provider.inputTypes,
+      usesImage: typeof item.providerInput !== 'string' && Boolean(item.providerInput?.imageUrl),
+      usesTextOnlyFallback: typeof item.providerInput === 'string'
+    })),
+    skippedProviders: executionPlan.skippedProviders
+  });
+
+  if (executionPlan.plans.length === 0) {
+    logEvent('ℹ️ [AI审核] 无可执行计划，跳过', {
+      hasImage: executionPlan.hasImage,
+      skippedProviders: executionPlan.skippedProviders
+    });
+    return null;
+  }
+
+  if (AI_CONCURRENT && executionPlan.plans.length > 1) {
+    logEvent('⚡ [AI审核] 并发抢答启动', {
+      providers: executionPlan.plans.map(item => item.provider.name)
+    });
+    return classifyMessageWithAIConcurrent(executionPlan);
+  }
+
+  logEvent('🔁 [AI审核] 主备轮询启动', {
+    providers: executionPlan.plans.map(item => item.provider.name)
+  });
+  return classifyMessageWithAISequential(executionPlan);
+}
+
+async function classifyMessageWithAI(input) {
+  const hasAnalyzableInput = typeof input === 'string'
+    ? Boolean(input.trim())
+    : Boolean(input?.text?.trim() || input?.imageUrl);
+
+  if (!AI_ENABLED || !hasAnalyzableInput || AI_PROVIDERS.length === 0) {
     logEvent('ℹ️ [AI审核] 跳过', {
       enabled: AI_ENABLED,
-      hasText: Boolean(text.trim()),
+      hasText: hasAnalyzableInput,
       providerCount: AI_PROVIDERS.length
     });
     return null;
   }
 
   try {
-    if (AI_CONCURRENT && AI_PROVIDERS.length > 1) {
-      logEvent('⚡ [AI审核] 并发抢答启动', {
-        providers: AI_PROVIDERS.map(provider => provider.name)
-      });
-      return await classifyMessageWithAIConcurrent(text);
-    }
-
-    logEvent('🔁 [AI审核] 主备轮询启动', {
-      providers: AI_PROVIDERS.map(provider => provider.name)
-    });
-    return await classifyMessageWithAISequential(text);
+    return await executeAiModeration(input);
   } catch (error) {
     console.error('AI审核失败:', error);
     return {
@@ -322,15 +507,18 @@ async function classifyMessageWithAI(text) {
   }
 }
 
-async function classifyMessageWithAISequential(text) {
-  for (const provider of AI_PROVIDERS) {
+async function classifyMessageWithAISequential(executionPlan) {
+  for (const plan of executionPlan.plans) {
+    const { provider, providerInput } = plan;
     try {
       logEvent('🤖 [AI节点] 开始请求', {
         provider: provider.name,
         model: provider.model,
-        endpoint: provider.endpoint
+        endpoint: provider.endpoint,
+        inputTypes: provider.inputTypes,
+        usesImage: typeof providerInput !== 'string' && Boolean(providerInput?.imageUrl)
       });
-      const result = await requestAiModeration(provider, text);
+      const result = await requestAiModeration(provider, providerInput);
       logEvent('✅ [AI节点] 请求完成', {
         provider: provider.name,
         result: result?.type || 'allow'
@@ -348,15 +536,17 @@ async function classifyMessageWithAISequential(text) {
   return null;
 }
 
-async function classifyMessageWithAIConcurrent(text) {
+async function classifyMessageWithAIConcurrent(executionPlan) {
   return new Promise((resolve, reject) => {
-    let remaining = AI_PROVIDERS.length;
+    const modelSummary = executionPlan.plans.map(item => item.provider.model).join(' + ');
+    let remaining = executionPlan.plans.length;
     let allowCount = 0;
     const errors = [];
     let settled = false;
 
-    for (const provider of AI_PROVIDERS) {
-      requestAiModeration(provider, text).then(result => {
+    for (const plan of executionPlan.plans) {
+      const { provider, providerInput } = plan;
+      requestAiModeration(provider, providerInput).then(result => {
         if (settled) {
           return;
         }
@@ -379,12 +569,18 @@ async function classifyMessageWithAIConcurrent(text) {
         }
 
         allowCount += 1;
-        if (allowCount === AI_PROVIDERS.length) {
+        if (allowCount === executionPlan.plans.length) {
           settled = true;
           logEvent('✅ [AI抢答] 全部节点均判定正常，放行', {
             allowCount
           });
-          resolve(null);
+          resolve({
+            source: 'ai:concurrent_allow',
+            provider: 'concurrent',
+            model: modelSummary,
+            type: null,
+            reason: '全部节点均判定正常'
+          });
           return;
         }
 
@@ -393,6 +589,8 @@ async function classifyMessageWithAIConcurrent(text) {
           const errorMessage = errors.map(item => item.message).join(' | ') || '存在未成功完成的AI节点';
           resolve({
             source: 'ai:concurrent_inconclusive',
+            provider: 'concurrent',
+            model: modelSummary,
             type: 'badWord',
             reason: `并发审核未形成双正常结论: ${errorMessage}`
           });
@@ -415,6 +613,8 @@ async function classifyMessageWithAIConcurrent(text) {
           settled = true;
           resolve({
             source: 'ai:concurrent_failed',
+            provider: 'concurrent',
+            model: modelSummary,
             type: 'badWord',
             reason: errors.map(item => item.message).join(' | ') || '所有AI节点均失败'
           });
@@ -426,6 +626,7 @@ async function classifyMessageWithAIConcurrent(text) {
 
 async function requestAiModeration(provider, text) {
   const startedAt = Date.now();
+  const userContent = buildAiUserContent(text);
   const response = await fetchWithTimeout(provider.endpoint, {
     method: 'POST',
     headers: buildAiHeaders(provider.apiKey),
@@ -437,11 +638,7 @@ async function requestAiModeration(provider, text) {
         { role: 'system', content: AI_SYSTEM_PROMPT },
         {
           role: 'user',
-          content: [
-            '请审核下面这条 Telegram 私聊消息。',
-            '只返回 JSON，不要返回代码块。',
-            `消息内容：${text}`
-          ].join('\n')
+          content: userContent
         }
       ]
     })
@@ -472,15 +669,49 @@ async function requestAiModeration(provider, text) {
     reason: truncateForLog(decision.reason || '', 60)
   });
 
-  if (decision.type) {
-    return {
-      source: `ai:${provider.name}`,
-      type: decision.type,
-      reason: decision.reason
-    };
+  return {
+    source: `ai:${provider.name}`,
+    provider: provider.name,
+    model: provider.model,
+    type: decision.type,
+    reason: decision.reason
+  };
+}
+
+function buildAiUserContent(input) {
+  if (typeof input === 'string') {
+    return [
+      '请审核下面这条 Telegram 私聊消息。',
+      '只返回 JSON，不要返回代码块。',
+      `消息内容：${input}`
+    ].join('\n');
   }
 
-  return null;
+  const text = String(input?.text || '').trim();
+  const imageUrl = String(input?.imageUrl || '').trim();
+  const textPrompt = [
+    '请审核下面这条 Telegram 私聊消息。',
+    '只返回 JSON，不要返回代码块。',
+    text ? `附带文字：${text}` : '附带文字：无',
+    imageUrl ? '还包含一张图片，请结合图片内容一起判断。' : '请仅根据文字判断。'
+  ].join('\n');
+
+  if (!imageUrl) {
+    return textPrompt;
+  }
+
+  return [
+    {
+      type: 'text',
+      text: textPrompt
+    },
+    {
+      type: 'image_url',
+      image_url: {
+        url: imageUrl
+      }
+    }
+  ];
 }
 
 function buildAiHeaders(apiKey) {
@@ -602,6 +833,10 @@ function getChat(msg = {}){
   return requestTelegram('getChat', makeReqBody(msg))
 }
 
+function getFile(msg = {}){
+  return requestTelegram('getFile', makeReqBody(msg))
+}
+
 /**
  * Wait for requests to the worker
  */
@@ -702,7 +937,7 @@ async function onMessage (message) {
 
   // 3. 安全获取消息内容
   // 图片/视频的文字在 caption 中，纯文本在 text 中，贴纸/无标题图片则为空字符串
-  const contentToCheck = message.text || message.caption || '';
+  const contentToCheck = getMessageTextContent(message);
 
   // 4. 管理员逻辑
   if(isAdmin){
@@ -745,6 +980,13 @@ async function onMessage (message) {
       });
       return checkBlock(message)
     }
+    if(message.text && /^\/test$/.exec(message.text)){
+      logEvent('🧪 [管理员命令] /test', {
+        adminChatId: message.chat.id,
+        replyToMessageId: message.reply_to_message?.message_id
+      });
+      return handleAiTest(message)
+    }
 
     let guestChantId = await nfd.get('msg-map-' + message?.reply_to_message.message_id,
                                       { type: "json" })
@@ -769,8 +1011,38 @@ async function onMessage (message) {
   }
 
   // 5. 访客消息先走本地规则，再走AI兜底审核
-  if (contentToCheck) {
-    const moderationResult = await moderateMessageContent(contentToCheck);
+  const keywordResult = contentToCheck ? containsBadWordsOrAds(contentToCheck) : null;
+  if (keywordResult) {
+    logEvent('🚨 [消息拦截] 审核命中', {
+      chatId: message.chat.id,
+      userId: message.from?.id || null,
+      source: 'keyword',
+      type: keywordResult,
+      reason: '',
+      preview: getTextPreviewForLog(contentToCheck)
+    });
+
+    return sendMessage({
+      chat_id: message.chat.id,
+      text: getBlockReplyText(keywordResult),
+    });
+  }
+
+  if (AI_ENABLED && AI_PROVIDERS.length > 0) {
+    const aiInput = await buildAiInputFromMessage(message);
+    if (aiInput) {
+    logEvent('🧠 [AI审核] 本地规则未命中，转AI复审', {
+      hasImage: typeof aiInput !== 'string' && Boolean(aiInput?.imageUrl),
+      textLength: typeof aiInput === 'string' ? aiInput.length : String(aiInput?.text || '').length,
+      preview: getTextPreviewForLog(typeof aiInput === 'string' ? aiInput : aiInput?.text || ''),
+      mode: AI_CONCURRENT ? 'concurrent' : 'sequential',
+      providers: AI_PROVIDERS.map(provider => ({
+        name: provider.name,
+        inputTypes: provider.inputTypes
+      }))
+    });
+
+    const moderationResult = await classifyMessageWithAI(aiInput);
     if (moderationResult?.type) {
       logEvent('🚨 [消息拦截] 审核命中', {
         chatId: message.chat.id,
@@ -778,13 +1050,14 @@ async function onMessage (message) {
         source: moderationResult.source,
         type: moderationResult.type,
         reason: moderationResult.reason || '',
-        preview: getTextPreviewForLog(contentToCheck)
+        preview: getTextPreviewForLog(typeof aiInput === 'string' ? aiInput : aiInput?.text || '')
       });
 
       return sendMessage({
         chat_id: message.chat.id,
         text: getBlockReplyText(moderationResult.type),
       });
+    }
     }
   }
 
@@ -865,6 +1138,89 @@ async function handleNotify(message){
       chatId
     });
   }
+}
+
+async function handleAiTest(message) {
+  if (!message.reply_to_message) {
+    return sendMessage({
+      chat_id: ADMIN_UID,
+      text: '🧪 使用方法：回复一条消息后发送 /test'
+    });
+  }
+
+  if (AI_PROVIDERS.length === 0) {
+    return sendMessage({
+      chat_id: ADMIN_UID,
+      text: '⚠️ AI 未配置，请先设置 ENV_AI_MODEL1_BASE_URL / ENV_AI_MODEL1_API_KEY / ENV_AI_MODEL1_MODEL'
+    });
+  }
+
+  const targetMessage = message.reply_to_message;
+  const contentToTest = getMessageTextContent(targetMessage);
+  const photoFileId = getLargestPhotoFileId(targetMessage);
+  if (!contentToTest && !photoFileId) {
+    return sendMessage({
+      chat_id: ADMIN_UID,
+      text: '📝 被测试的消息没有可供 AI 分析的文本、caption 或图片。'
+    });
+  }
+
+  let aiInput = contentToTest;
+  if (photoFileId) {
+    const fileInfo = await getFile({ file_id: photoFileId });
+    if (!fileInfo || !fileInfo.ok || !fileInfo.result?.file_path) {
+      return sendMessage({
+        chat_id: ADMIN_UID,
+        text: '⚠️ 无法获取该图片的 Telegram 文件地址，暂时不能做图片 AI 测试。'
+      });
+    }
+
+    aiInput = {
+      text: contentToTest,
+      imageUrl: getTelegramFileDownloadUrl(fileInfo.result.file_path)
+    };
+  }
+
+  let result;
+  try {
+    result = await executeAiModeration(aiInput);
+  } catch (error) {
+    console.error('AI测试执行失败:', error);
+    return sendMessage({
+      chat_id: ADMIN_UID,
+      text: [
+        '🧪 AI 测试结果',
+        `⚙️ 使用模式：${getAiModeLabel()}`,
+        `🤖 使用模型：${AI_PROVIDERS.map(provider => `${provider.model} [${provider.inputTypes.join('/')}]`).join(' + ')}`,
+        '🚫 判定结果：调用失败',
+        `📌 原因说明：${error.message || '未知错误'}`
+      ].join('\n')
+    });
+  }
+
+  if (!result) {
+    return sendMessage({
+      chat_id: ADMIN_UID,
+      text: [
+        '🧪 AI 测试结果',
+        `⚙️ 使用模式：${getAiModeLabel()}`,
+        `🤖 使用模型：${AI_PROVIDERS.map(provider => `${provider.model} [${provider.inputTypes.join('/')}]`).join(' + ')}`,
+        '🚫 判定结果：调用失败',
+        '📌 原因说明：所有 AI 节点均未成功返回结果'
+      ].join('\n')
+    });
+  }
+
+  return sendMessage({
+    chat_id: ADMIN_UID,
+    text: [
+      '🧪 AI 测试结果',
+      `⚙️ 使用模式：${getAiModeLabel()}`,
+      `🤖 使用模型：${result.model || AI_PROVIDERS.map(provider => `${provider.model} [${provider.inputTypes.join('/')}]`).join(' + ')}`,
+      `✅ 判定结果：${getDecisionLabel(result.type)}`,
+      `📌 原因说明：${result.reason || '未命中广告或违规特征'}`
+    ].join('\n')
+  });
 }
 
 async function handleUserInfo(uid){
