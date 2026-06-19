@@ -632,6 +632,7 @@ async function requestAiModeration(provider, text) {
     headers: buildAiHeaders(provider.apiKey),
     body: JSON.stringify({
       model: provider.model,
+      stream: false,
       temperature: 0,
       max_tokens: 200,
       messages: [
@@ -645,11 +646,10 @@ async function requestAiModeration(provider, text) {
   }, AI_TIMEOUT_MS);
 
   if (!response.ok) {
-    throw new Error(`HTTP ${response.status} ${response.statusText}`);
+    throw await buildAiHttpError(response);
   }
 
-  const result = await response.json();
-  const content = result?.choices?.[0]?.message?.content;
+  const content = await readAiResponseContent(response);
   if (!content) {
     throw new Error('AI响应中缺少choices[0].message.content');
   }
@@ -676,6 +676,186 @@ async function requestAiModeration(provider, text) {
     type: decision.type,
     reason: decision.reason
   };
+}
+
+async function buildAiHttpError(response) {
+  const rawText = await response.text();
+  const detail = extractAiErrorDetail(rawText);
+  const suffix = detail ? `: ${truncateForLog(detail, 200)}` : '';
+  return new Error(`HTTP ${response.status} ${response.statusText}${suffix}`);
+}
+
+function extractAiErrorDetail(rawText) {
+  const trimmed = String(rawText || '').trim();
+  if (!trimmed) {
+    return '';
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed);
+    const message = parsed?.error?.message || parsed?.message || parsed?.error;
+    if (typeof message === 'string' && message.trim()) {
+      return message.trim();
+    }
+  } catch (error) {
+    // Ignore JSON parse failure and fall back to raw text preview.
+  }
+
+  return trimmed;
+}
+
+async function readAiResponseContent(response) {
+  const rawText = await response.text();
+  const trimmed = rawText.trim();
+
+  if (!trimmed) {
+    throw new Error('AI响应为空');
+  }
+
+  if (looksLikeSseResponse(response, trimmed)) {
+    return extractContentFromSsePayload(trimmed);
+  }
+
+  let result;
+  try {
+    result = JSON.parse(trimmed);
+  } catch (error) {
+    throw new Error(`AI响应不是合法JSON: ${error.message}`);
+  }
+
+  return extractContentFromAiPayload(result);
+}
+
+function looksLikeSseResponse(response, bodyText) {
+  const contentType = String(response.headers.get('content-type') || '').toLowerCase();
+  return contentType.includes('text/event-stream') || /(^|\n)\s*(?::|event:|data:)/i.test(bodyText);
+}
+
+function extractContentFromSsePayload(payloadText) {
+  const events = [];
+  let currentDataLines = [];
+
+  for (const rawLine of payloadText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+
+    if (!line) {
+      if (currentDataLines.length > 0) {
+        events.push(currentDataLines.join('\n'));
+        currentDataLines = [];
+      }
+      continue;
+    }
+
+    if (line.startsWith(':')) {
+      continue;
+    }
+
+    if (/^data:/i.test(line)) {
+      currentDataLines.push(line.slice(5).trim());
+      continue;
+    }
+
+    if (/^(event|id|retry):/i.test(line)) {
+      continue;
+    }
+  }
+
+  if (currentDataLines.length > 0) {
+    events.push(currentDataLines.join('\n'));
+  }
+
+  const normalizedEvents = events.filter(line => line && line !== '[DONE]');
+
+  if (normalizedEvents.length === 0) {
+    throw new Error('SSE响应中没有可解析的data事件');
+  }
+
+  let aggregatedContent = '';
+  let fallbackContent = '';
+
+  for (const eventText of normalizedEvents) {
+    let eventPayload;
+    try {
+      eventPayload = JSON.parse(eventText);
+    } catch (error) {
+      throw new Error(`SSE事件不是合法JSON: ${error.message}`);
+    }
+
+    const directContent = extractContentFromAiPayload(eventPayload);
+    if (directContent) {
+      fallbackContent = directContent;
+    }
+
+    const deltaContent = extractDeltaContentFromAiPayload(eventPayload);
+    if (deltaContent) {
+      aggregatedContent += deltaContent;
+    }
+  }
+
+  return aggregatedContent || fallbackContent;
+}
+
+function extractContentFromAiPayload(payload) {
+  const choice = payload?.choices?.[0];
+  if (!choice || typeof choice !== 'object') {
+    return '';
+  }
+
+  const messageContent = normalizeAiContentValue(choice.message?.content);
+  if (messageContent) {
+    return messageContent;
+  }
+
+  const directContent = normalizeAiContentValue(choice.content);
+  if (directContent) {
+    return directContent;
+  }
+
+  const textContent = normalizeAiContentValue(choice.text);
+  if (textContent) {
+    return textContent;
+  }
+
+  return '';
+}
+
+function extractDeltaContentFromAiPayload(payload) {
+  const choice = payload?.choices?.[0];
+  if (!choice || typeof choice !== 'object') {
+    return '';
+  }
+
+  return normalizeAiContentValue(choice.delta?.content);
+}
+
+function normalizeAiContentValue(value) {
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  if (Array.isArray(value)) {
+    return value
+      .map(item => {
+        if (typeof item === 'string') {
+          return item;
+        }
+
+        if (item && typeof item === 'object') {
+          if (typeof item.text === 'string') {
+            return item.text;
+          }
+
+          if (typeof item.content === 'string') {
+            return item.content;
+          }
+        }
+
+        return '';
+      })
+      .join('');
+  }
+
+  return '';
 }
 
 function buildAiUserContent(input) {
@@ -735,9 +915,19 @@ async function fetchWithTimeout(url, init, timeoutMs) {
       ...init,
       signal: controller.signal
     });
+  } catch (error) {
+    if (isAbortError(error)) {
+      throw new Error(`AI请求超时（${timeoutMs}ms）`);
+    }
+
+    throw error;
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function isAbortError(error) {
+  return error?.name === 'AbortError';
 }
 
 function parseAiJson(content) {
